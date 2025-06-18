@@ -2,7 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const webPush = require('web-push'); // NOWOŚĆ: dodajemy web-push
+const webPush = require('web-push');
+const bcrypt = require('bcryptjs'); // ZMIANA: Dodajemy bcryptjs do haszowania haseł
+const jwt = require('jsonwebtoken'); // ZMIANA: Dodajemy jsonwebtoken do autoryzacji
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -10,6 +12,14 @@ const port = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// ZMIANA: Sekretny klucz JWT - BARDZO WAŻNE: Wygeneruj to i przechowuj w .env!
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret) {
+    console.error('Brak JWT_SECRET w zmiennych środowiskowych! Aplikacja nie będzie bezpieczna.');
+    console.error('Wygeneruj losowy, długi ciąg znaków i dodaj do .env jako JWT_SECRET.');
+    process.exit(1); // Zakończ aplikację, jeśli brak klucza (dla środowiska produkcyjnego)
+}
 
 // Połączenie z bazą danych MongoDB
 const mongoURI = process.env.MONGO_URI || 'mongodb://localhost:27017/czat_app';
@@ -21,8 +31,7 @@ mongoose.connect(mongoURI)
 // Definicja Schematu i Modelu Mongoose dla Użytkowników
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
-    password: { type: String, required: true },
-    // NOWOŚĆ: Dodajemy pole do przechowywania subskrypcji powiadomień push
+    password: { type: String, required: true }, // ZMIANA: Hasło będzie haszowane
     pushSubscription: { type: Object }
 });
 const User = mongoose.model('User', userSchema);
@@ -36,9 +45,7 @@ const messageSchema = new mongoose.Schema({
 });
 const Message = mongoose.model('Message', messageSchema);
 
-// ----- Konfiguracja Web Push (NOWOŚĆ) -----
-// WAŻNE: Wygeneruj własne VAPID keys! Możesz to zrobić raz, np. przez `npx web-push generate-vapid-keys` w terminalu.
-// Następnie dodaj je do pliku .env i nie udostępniaj nikomu!
+// ----- Konfiguracja Web Push -----
 const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
 const privateVapidKey = process.env.VAPID_PRIVATE_KEY;
 
@@ -54,14 +61,38 @@ if (!publicVapidKey || !privateVapidKey) {
     console.log('Klucze VAPID skonfigurowane.');
 }
 
+// NOWOŚĆ: Middleware do weryfikacji tokenów JWT
+const authenticateToken = (req, res, next) => {
+    // Pobierz token z nagłówka Authorization
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Format: Bearer TOKEN
+
+    if (token == null) {
+        return res.status(401).json({ message: 'Brak tokenu autoryzacyjnego.' });
+    }
+
+    jwt.verify(token, jwtSecret, (err, user) => {
+        if (err) {
+            console.error('Błąd weryfikacji tokenu:', err.message);
+            // Zwróć 403 Forbidden, jeśli token jest nieprawidłowy (np. wygasł)
+            return res.status(403).json({ message: 'Nieprawidłowy lub wygasły token autoryzacyjny.' });
+        }
+        req.user = user; // Dodaj payload tokenu do obiektu żądania
+        next(); // Przejdź do następnego middleware/endpointu
+    });
+};
 
 // ----- Endpointy API -----
 
-// Rejestracja użytkownika (bez zmian)
+// Rejestracja użytkownika (ZMIANA: Haszowanie hasła)
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
     try {
-        const newUser = new User({ username, password });
+        // ZMIANA: Haszowanie hasła przed zapisaniem
+        const salt = await bcrypt.genSalt(10); // Generuj "sól"
+        const hashedPassword = await bcrypt.hash(password, salt); // Haszuj hasło z solą
+
+        const newUser = new User({ username, password: hashedPassword });
         await newUser.save();
         res.status(201).json({ message: 'Użytkownik zarejestrowany pomyślnie!' });
     } catch (error) {
@@ -72,23 +103,46 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Logowanie użytkownika (bez zmian)
+// Logowanie użytkownika (ZMIANA: Porównywanie haszowanego hasła i generowanie JWT)
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     try {
-        const user = await User.findOne({ username, password });
+        const user = await User.findOne({ username });
         if (!user) {
             return res.status(401).json({ message: 'Nieprawidłowa nazwa użytkownika lub hasło.' });
         }
-        res.status(200).json({ message: 'Zalogowano pomyślnie!', userId: user._id, username: user.username });
+
+        // ZMIANA: Porównanie haszowanego hasła
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Nieprawidłowa nazwa użytkownika lub hasło.' });
+        }
+
+        // ZMIANA: Generowanie tokenu JWT
+        const token = jwt.sign(
+            { userId: user._id, username: user.username },
+            jwtSecret,
+            { expiresIn: '1h' } // Token wygaśnie po 1 godzinie (dla sesji)
+        );
+
+        res.status(200).json({
+            message: 'Zalogowano pomyślnie!',
+            token: token, // Zwracamy token
+            userId: user._id, // Opcjonalnie, do użycia w frontendzie (np. dla localStorage)
+            username: user.username // Opcjonalnie
+        });
     } catch (error) {
         res.status(500).json({ message: 'Błąd logowania.', error: error.message });
     }
 });
 
-// Wysyłanie wiadomości (ZMODYFIKOWANE: dodajemy wysyłanie powiadomień push)
-app.post('/send-message', async (req, res) => {
-    const { senderId, receiverUsername, content } = req.body;
+// Wysyłanie wiadomości (ZMIANA: Chronimy endpoint za pomocą authenticateToken)
+// Teraz tylko zalogowani użytkownicy z ważnym tokenem mogą wysyłać wiadomości
+app.post('/send-message', authenticateToken, async (req, res) => { // ZMIANA
+    // req.user zawiera teraz payload z tokenu (userId i username)
+    const senderId = req.user.userId; // ZMIANA: Pobieramy senderId z tokenu
+    const { receiverUsername, content } = req.body;
+
     try {
         const receiver = await User.findOne({ username: receiverUsername });
         if (!receiver) {
@@ -96,7 +150,8 @@ app.post('/send-message', async (req, res) => {
         }
         const sender = await User.findById(senderId); // Pobierz nadawcę dla nazwy w powiadomieniu
         if (!sender) {
-            return res.status(404).json({ message: 'Nadawca nie istnieje.' });
+            // To nie powinno się zdarzyć, jeśli token jest prawidłowy i użytkownik istnieje
+            return res.status(404).json({ message: 'Nadawca nie istnieje lub błąd autoryzacji.' });
         }
 
         const newMessage = new Message({
@@ -106,21 +161,19 @@ app.post('/send-message', async (req, res) => {
         });
         await newMessage.save();
 
-        // NOWOŚĆ: Wyślij powiadomienie push do odbiorcy, jeśli ma subskrypcję
         if (receiver.pushSubscription) {
             const payload = JSON.stringify({
                 title: `Nowa wiadomość od ${sender.username}!`,
                 body: content,
-                icon: '/icon.png', // Ikona powiadomienia (musi być dostępna publicznie)
-                data: { url: process.env.FRONTEND_URL || 'http://localhost:8080' } // URL do otwarcia po kliknięciu
+                icon: '/icon.png',
+                data: { url: process.env.FRONTEND_URL || 'http://localhost:8080' }
             });
             try {
                 await webPush.sendNotification(receiver.pushSubscription, payload);
                 console.log('Powiadomienie push wysłane do', receiver.username);
             } catch (pushError) {
                 console.error('Błąd wysyłania powiadomienia push:', pushError);
-                // Usuń nieaktualną subskrypcję, jeśli wystąpi błąd (np. użytkownik ją usunął)
-                if (pushError.statusCode === 410) { // GONE status
+                if (pushError.statusCode === 410) {
                     receiver.pushSubscription = undefined;
                     await receiver.save();
                     console.log('Usunięto nieaktualną subskrypcję dla', receiver.username);
@@ -134,9 +187,10 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-// Pobieranie odebranych wiadomości (bez zmian)
-app.get('/messages/:userId', async (req, res) => {
-    const { userId } = req.params;
+// Pobieranie odebranych wiadomości (ZMIANA: Chronimy endpoint)
+// Użytkownik może pobrać tylko SWOJE wiadomości
+app.get('/messages/:userId', authenticateToken, async (req, res) => { // ZMIANA
+    const userId = req.user.userId; // ZMIANA: Pobieramy userId z tokenu, ignorujemy parametry URL
     const since = req.query.since ? parseInt(req.query.since) : 0;
 
     try {
@@ -155,9 +209,10 @@ app.get('/messages/:userId', async (req, res) => {
     }
 });
 
-// Pobieranie wszystkich użytkowników (bez zmian)
-app.get('/users', async (req, res) => {
+// Pobieranie wszystkich użytkowników (ZMIANA: Chronimy endpoint)
+app.get('/users', authenticateToken, async (req, res) => { // ZMIANA
     try {
+        // Nadal pobieramy wszystkich użytkowników do wyboru odbiorcy, ale tylko dla zalogowanych
         const users = await User.find({}, 'username');
         res.status(200).json(users);
     } catch (error) {
@@ -165,10 +220,10 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// NOWOŚĆ: Endpoint do odbierania subskrypcji powiadomień push z frontendu
-app.post('/subscribe-push', async (req, res) => {
+// Endpoint do odbierania subskrypcji powiadomień push z frontendu (ZMIANA: Chronimy endpoint)
+app.post('/subscribe-push', authenticateToken, async (req, res) => { // ZMIANA
     const subscription = req.body.subscription;
-    const userId = req.body.userId;
+    const userId = req.user.userId; // ZMIANA: Pobieramy userId z tokenu
 
     if (!subscription || !userId) {
         return res.status(400).json({ message: 'Brak danych subskrypcji lub ID użytkownika.' });
@@ -190,7 +245,7 @@ app.post('/subscribe-push', async (req, res) => {
     }
 });
 
-// NOWOŚĆ: Endpoint do pobierania klucza publicznego VAPID dla frontendu
+// Endpoint do pobierania klucza publicznego VAPID dla frontendu (BEZ ZMIAN: nie wymaga autoryzacji)
 app.get('/vapidPublicKey', (req, res) => {
     res.status(200).json({ publicKey: publicVapidKey });
 });
