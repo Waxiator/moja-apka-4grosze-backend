@@ -189,19 +189,27 @@ app.post('/send-message', authenticateToken, async (req, res) => { // ZMIANA
 
 // Pobieranie odebranych wiadomości (ZMIANA: Chronimy endpoint)
 // Użytkownik może pobrać tylko SWOJE wiadomości
-app.get('/messages/:userId', authenticateToken, async (req, res) => { // ZMIANA
-    const userId = req.user.userId; // ZMIANA: Pobieramy userId z tokenu, ignorujemy parametry URL
-    const since = req.query.since ? parseInt(req.query.since) : 0;
+app.get('/messages/:userId', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const since = req.query.since ? parseInt(req.query.since) : 0; // Ta zmienna nie jest już używana w nowym fetchMessages, ale nie przeszkadza
 
     try {
-        let query = { receiver: userId };
-        if (since > 0) {
-            query.timestamp = { $gt: new Date(since) };
-        }
+        let query = {
+            $or: [ // Pobieramy wiadomości, gdzie użytkownik jest odbiorcą LUB nadawcą
+                { receiver: userId },
+                { sender: userId }
+            ]
+        };
+        // Jeśli będziesz chciał filtrować po czasie, możesz to dodać z powrotem.
+        // if (since > 0) {
+        //     query.timestamp = { $gt: new Date(since) };
+        // }
 
+        // ZMIANA: Pobieramy username i _id nadawcy (i odbiorcy, jeśli chcesz)
         const messages = await Message.find(query)
-                                       .populate('sender', 'username')
-                                       .sort({ timestamp: 1 });
+                                       .populate('sender', 'username _id') // ZMIANA: Dodajemy '_id'
+                                       .populate('receiver', 'username _id') // Opcjonalnie: pobierz odbiorcę
+                                       .sort({ timestamp: 1 }); // Sortuj od najstarszych do najnowszych
 
         res.status(200).json(messages);
     } catch (error) {
