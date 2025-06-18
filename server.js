@@ -86,14 +86,21 @@ app.post('/send-message', async (req, res) => {
 });
 
 // Pobieranie odebranych wiadomości dla danego użytkownika
+// Pobieranie odebranych wiadomości dla danego użytkownika
 app.get('/messages/:userId', async (req, res) => {
     const { userId } = req.params;
+    const since = req.query.since ? parseInt(req.query.since) : 0; // Pobierz timestamp 'od kiedy'
+
     try {
-        // Pobierz wiadomości, gdzie 'receiver' to dany userId
-        // Użyj populate('sender', 'username') aby pobrać nazwę użytkownika nadawcy
-        const messages = await Message.find({ receiver: userId })
-                                       .populate('sender', 'username') // Pobiera tylko pole 'username' z obiektu User
-                                       .sort({ timestamp: -1 }); // Sortuj od najnowszych
+        let query = { receiver: userId };
+        if (since > 0) {
+            query.timestamp = { $gt: new Date(since) }; // Tylko wiadomości nowsze niż timestamp
+        }
+
+        const messages = await Message.find(query)
+                                       .populate('sender', 'username')
+                                       .sort({ timestamp: 1 }); // Sortuj od najstarszych do najnowszych, żeby timestamp był rosnący
+
         res.status(200).json(messages);
     } catch (error) {
         res.status(500).json({ message: 'Błąd pobierania wiadomości.', error: error.message });
